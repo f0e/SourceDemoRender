@@ -14,6 +14,10 @@ IDirect3DDevice9Ex* svr_d3d9ex_device;
 IDirect3DSurface9* svr_d3d9ex_content_surf;
 IDirect3DSurface9* svr_d3d9ex_share_surf;
 
+// The D3D9Ex and D3D11 devices are not synchronized with each other, so access to the shared surface has to be synchronized manually.
+IDirect3DQuery9* svr_d3d9ex_sync_query;
+ID3D11Query* svr_d3d11_sync_query;
+
 // For D3D11 we can read the game texture directly.
 // Destination texture that we work with (Both D3D11 and D3D9Ex).
 ID3D11Texture2D* svr_content_tex;
@@ -46,8 +50,10 @@ int32_t svr_dll_version()
 // Stuff that is created during init.
 void free_all_static_svr_stuff()
 {
+    svr_maybe_release(&svr_d3d11_sync_query);
     svr_maybe_release(&svr_d3d11_device);
     svr_maybe_release(&svr_d3d11_context);
+    svr_maybe_release(&svr_d3d9ex_sync_query);
     svr_maybe_release(&svr_d3d9ex_device);
 }
 
@@ -169,6 +175,31 @@ bool svr_init(const char* svr_path, IUnknown* game_device)
             svr_log("ERROR: Could not create D3D11 device (%#x)\n", hr);
             goto rfail;
         }
+
+        hr = svr_d3d9ex_device->CreateQuery(D3DQUERYTYPE_EVENT, &svr_d3d9ex_sync_query);
+
+        if (FAILED(hr))
+        {
+            svr_d3d9ex_sync_query = NULL;
+            svr_log("WARNING: Could not create D3D9Ex sync query (%#x). Frames may be duplicated in the output\n", hr);
+        }
+
+        D3D11_QUERY_DESC query_desc = {};
+        query_desc.Query = D3D11_QUERY_EVENT;
+
+        hr = svr_d3d11_device->CreateQuery(&query_desc, &svr_d3d11_sync_query);
+
+        if (FAILED(hr))
+        {
+            svr_d3d11_sync_query = NULL;
+            svr_log("WARNING: Could not create D3D11 sync query (%#x). Frames may be duplicated in the output\n", hr);
+        }
+
+        else
+        {
+            // Issue once so the first wait has something to wait on.
+            svr_d3d11_context->End(svr_d3d11_sync_query);
+        }
     }
 
     if (!proc_state.init(svr_path, svr_d3d11_device))
@@ -191,14 +222,49 @@ bool svr_movie_active()
     return svr_movie_running;
 }
 
+// Wait until the D3D9Ex device is done writing to the shared surface.
+void wait_for_d3d9ex_gpu()
+{
+    if (svr_d3d9ex_sync_query == NULL)
+    {
+        return;
+    }
+
+    svr_d3d9ex_sync_query->Issue(D3DISSUE_END);
+
+    // Anything other than S_FALSE means we should stop waiting (done or device lost).
+    while (svr_d3d9ex_sync_query->GetData(NULL, 0, D3DGETDATA_FLUSH) == S_FALSE)
+    {
+        _mm_pause();
+    }
+}
+
+// Wait until the D3D11 device is done reading from the shared surface.
+void wait_for_d3d11_gpu()
+{
+    if (svr_d3d11_sync_query == NULL)
+    {
+        return;
+    }
+
+    while (svr_d3d11_context->GetData(svr_d3d11_sync_query, NULL, 0, 0) == S_FALSE)
+    {
+        _mm_pause();
+    }
+}
+
 void copy_shared_d3d9ex_tex_to_d3d11_tex()
 {
     // If we are a D3D9Ex game, we have to copy over the game content texture to the D3D11 texture.
     if (svr_d3d9ex_device)
     {
+        wait_for_d3d11_gpu();
+
         // Copy over the game content to the shared texture.
         // Don't use any filtering type because the source and destinations are both same size.
         svr_d3d9ex_device->StretchRect(svr_d3d9ex_content_surf, NULL, svr_d3d9ex_share_surf, NULL, D3DTEXF_NONE);
+
+        wait_for_d3d9ex_gpu();
     }
 }
 
@@ -339,6 +405,13 @@ void svr_frame()
     // The D3D11 texture now contains the game content.
 
     proc_state.new_video_frame();
+
+    // Everything that reads the shared surface has been submitted now.
+    if (svr_d3d9ex_device && svr_d3d11_sync_query)
+    {
+        svr_d3d11_context->End(svr_d3d11_sync_query);
+    }
+
     proc_state.studio_update();
 }
 
