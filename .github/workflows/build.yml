@@ -1,0 +1,66 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  build:
+    name: Build
+    runs-on: windows-2025-vs2026
+    permissions:
+      contents: write # upload svr.zip to the release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+
+      - name: Download ffmpeg
+        run: |
+          $ffmpeg = "ffmpeg-n8.1-latest-win64-gpl-shared-8.1"
+          Invoke-WebRequest "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$ffmpeg.zip" -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip .
+
+          Copy-Item -Recurse -Force "$ffmpeg\*" deps\ffmpeg
+          Copy-Item deps\ffmpeg\bin\*.dll bin
+
+      - name: Build shaders
+        run: .\build_shaders.cmd
+
+      - name: Build
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          msbuild deps\minhook\build\VC16\MinHookVC16.sln /t:libMinHook /p:Configuration=Release /p:Platform=x64 /noLogo
+          msbuild svr.slnx /p:Configuration=Release /p:Platform=x64 /noLogo
+
+      - name: Package
+        run: .\publish.cmd
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: svr
+          path: svr.zip
+          if-no-files-found: error
+
+      - name: Upload to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload $env:GITHUB_REF_NAME svr.zip --clobber
